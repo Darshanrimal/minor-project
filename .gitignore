@@ -1,0 +1,28 @@
+# Node modules
+project/backend/node_modules/
+project/frontend/node_modules/
+
+# Build output
+project/frontend/dist/
+
+# Environment files
+project/backend/.env
+project/frontend/.env
+*.env
+
+# Local dev settings
+.vscode/
+.project
+*.log
+
+# Solana local data
+project/backend/.solana/
+
+# Database files
+project/backend/*.db
+
+# Vite cache
+project/frontend/node_modules/.vite/
+
+# Mac system files
+.DS_Store

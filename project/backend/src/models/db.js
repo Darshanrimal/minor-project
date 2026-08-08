@@ -1,24 +1,15 @@
 // src/models/db.js
-// Pure-JS SQLite via sql.js — no native compilation required.
-//
-// Two critical bugs fixed vs naive implementations:
-// 1. last_insert_rowid() must be read BEFORE db.export() (saveDb resets it to 0)
-// 2. saveDb() must NOT be called inside an open transaction — db.export()
-//    commits the transaction implicitly, making the explicit COMMIT fail.
-
 const initSqlJs = require("sql.js");
 const path      = require("path");
 const fs        = require("fs");
+const { convertNprToSol } = require("../services/esewaService");
 
 const DB_PATH = path.resolve(__dirname, "../../charity.db");
-let db             = null;
-let inTransaction  = false; // global flag — sql.js has one connection
-
-// ── Internal helpers ─────────────────────────────────────────────────────────
+let db            = null;
+let inTransaction = false;
 
 function saveDb() {
-  if (!db) return;
-  if (inTransaction) return; // NEVER save mid-transaction (breaks COMMIT)
+  if (!db || inTransaction) return;
   const data = db.export();
   fs.writeFileSync(DB_PATH, Buffer.from(data));
 }
@@ -29,7 +20,6 @@ function getDb() {
 }
 
 function readLastInsertId() {
-  // Must be called BEFORE saveDb() — export() resets last_insert_rowid to 0
   const stmt = db.prepare("SELECT last_insert_rowid() AS id");
   stmt.step();
   const row = stmt.getAsObject();
@@ -37,7 +27,67 @@ function readLastInsertId() {
   return typeof row.id === "number" ? row.id : 0;
 }
 
-// ── Schema ───────────────────────────────────────────────────────────────────
+function normalizeLegacyDonationData() {
+  // Repair legacy SOL rows that predate blockchain_ref storage by copying the transaction signature across.
+  db.run(`
+    UPDATE donations
+    SET blockchain_ref = tx_signature
+    WHERE payment_method = 'sol'
+      AND tx_signature IS NOT NULL
+      AND tx_signature <> ''
+      AND (blockchain_ref IS NULL OR blockchain_ref = '')
+  `);
+
+  const stmt = db.prepare(`
+    SELECT id, amount_npr, amount_sol, tx_signature, esewa_ref_id
+    FROM donations
+    WHERE payment_method = 'esewa'
+  `);
+
+  while (stmt.step()) {
+    const row = stmt.getAsObject();
+    const amountNpr = typeof row.amount_npr === "number" ? row.amount_npr : parseFloat(row.amount_npr);
+    const amountSol = typeof row.amount_sol === "number" ? row.amount_sol : parseFloat(row.amount_sol);
+    const derivedRef =
+      row.esewa_ref_id ||
+      (typeof row.tx_signature === "string" && row.tx_signature.startsWith("campaign-")
+        ? row.tx_signature
+        : typeof row.tx_signature === "string" && row.tx_signature.startsWith("ESEWA-")
+          ? row.tx_signature.replace(/^ESEWA-/, "")
+          : null);
+
+    if (derivedRef && derivedRef !== row.esewa_ref_id) {
+      db.run("UPDATE donations SET esewa_ref_id = ? WHERE id = ?", [derivedRef, row.id]);
+    }
+
+    if (Number.isFinite(amountNpr) && amountNpr > 0 && (!Number.isFinite(amountSol) || amountSol <= 0)) {
+      const repairedSol = convertNprToSol(amountNpr);
+      if (repairedSol) {
+        db.run("UPDATE donations SET amount_sol = ? WHERE id = ?", [repairedSol, row.id]);
+      }
+    }
+  }
+
+  stmt.free();
+
+  // Remove broken placeholder eSewa rows that were stored without any actual amount.
+  db.run(`
+    DELETE FROM donations
+    WHERE payment_method = 'esewa'
+      AND (amount_npr IS NULL OR amount_npr <= 0)
+      AND (amount_sol IS NULL OR amount_sol <= 0)
+  `);
+
+  // Recompute campaign progress from the repaired donation ledger so raised_amount stays trustworthy.
+  db.run(`
+    UPDATE campaigns
+    SET raised_amount = COALESCE((
+      SELECT ROUND(SUM(COALESCE(d.amount_sol, 0)), 9)
+      FROM donations d
+      WHERE d.campaign_id = campaigns.id
+    ), 0)
+  `);
+}
 
 function runSchema() {
   db.run(`
@@ -77,6 +127,7 @@ function runSchema() {
       description      TEXT,
       category         TEXT NOT NULL DEFAULT 'other',
       goal_amount      REAL NOT NULL,
+      goal_amount_npr  REAL,
       raised_amount    REAL NOT NULL DEFAULT 0,
       start_date       TEXT,
       end_date         TEXT,
@@ -103,20 +154,37 @@ function runSchema() {
     );
 
     CREATE TABLE IF NOT EXISTS donations (
-      id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      campaign_id  INTEGER NOT NULL REFERENCES campaigns(id),
-      user_id      INTEGER REFERENCES users(id),
-      donor_wallet TEXT NOT NULL,
-      amount_sol   REAL NOT NULL,
-      tx_signature TEXT NOT NULL UNIQUE,
-      message      TEXT,
-      created_at   TEXT DEFAULT (datetime('now'))
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      campaign_id    INTEGER NOT NULL REFERENCES campaigns(id),
+      user_id        INTEGER REFERENCES users(id),
+      donor_wallet   TEXT NOT NULL DEFAULT 'esewa',
+      amount_sol     REAL NOT NULL DEFAULT 0,
+      amount_npr     REAL,
+      tx_signature   TEXT NOT NULL UNIQUE,
+      blockchain_ref TEXT,
+      esewa_ref_id   TEXT,
+      message        TEXT,
+      payment_method TEXT NOT NULL DEFAULT 'sol'
+                     CHECK(payment_method IN ('sol','esewa')),
+      created_at     TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  // Safe migrations for existing databases
+  const migrations = [
+    "ALTER TABLE donations ADD COLUMN payment_method TEXT DEFAULT 'sol'",
+    "ALTER TABLE donations ADD COLUMN amount_npr REAL",
+    "ALTER TABLE donations ADD COLUMN blockchain_ref TEXT",
+    "ALTER TABLE donations ADD COLUMN esewa_ref_id TEXT",
+    "ALTER TABLE campaigns ADD COLUMN goal_amount_npr REAL",
+  ];
+  for (const sql of migrations) {
+    try { db.run(sql); } catch (_) { /* column already exists — safe to ignore */ }
+  }
+
+  normalizeLegacyDonationData();
   saveDb();
 }
-
-// ── Init ─────────────────────────────────────────────────────────────────────
 
 async function initDb() {
   const SQL = await initSqlJs();
@@ -130,100 +198,64 @@ async function initDb() {
   return db;
 }
 
-// ── Core executor ─────────────────────────────────────────────────────────────
-
 function execQuery(sql, params = []) {
   const database = getDb();
   const trimmed  = sql.trim().toUpperCase();
 
-  // SELECT
-  if (trimmed.startsWith("SELECT") || trimmed.startsWith("WITH")) {
+  if (trimmed.startsWith("SELECT") || trimmed.startsWith("WITH") || trimmed.startsWith("PRAGMA")) {
     const stmt = database.prepare(sql);
     const rows = [];
     if (params.length > 0) stmt.bind(params);
     while (stmt.step()) rows.push(stmt.getAsObject());
     stmt.free();
-    return [rows];
+    return [rows, {}];
   }
 
-  // INSERT / UPDATE / DELETE
-  database.run(sql, params);
+  const stmt = database.prepare(sql);
+  if (params.length > 0) stmt.bind(params);
+  stmt.step();
+  stmt.free();
+  const insertId     = readLastInsertId();
   const affectedRows = database.getRowsModified();
-
-  if (trimmed.startsWith("INSERT")) {
-    const insertId = readLastInsertId(); // BEFORE saveDb
-    saveDb();                            // skipped if inTransaction
-    return [{ insertId, affectedRows }];
-  }
-
-  saveDb();
-  return [{ affectedRows }];
+  if (!inTransaction) saveDb();
+  return [{ affectedRows, insertId }, {}];
 }
 
-// ── Public API ────────────────────────────────────────────────────────────────
+function query(sql, params = []) {
+  return Promise.resolve(execQuery(sql, params));
+}
 
-const dbWrapper = {
-  // Async wrapper (routes use await db.query(...))
-  query: async (sql, params = []) => {
-    try {
-      return execQuery(sql, params);
-    } catch (err) {
-      console.error("DB Error:", err.message, "\nSQL:", sql);
-      throw err;
-    }
-  },
+function queryIn(sql, arrayParam) {
+  if (!Array.isArray(arrayParam) || arrayParam.length === 0) {
+    return Promise.resolve([[], {}]);
+  }
+  const placeholders = arrayParam.map(() => "?").join(",");
+  const expanded     = sql.replace("IN (?)", `IN (${placeholders})`);
+  return query(expanded, arrayParam);
+}
 
-  // IN-clause expansion: db.queryIn('WHERE id IN (?)', [1,2,3])
-  queryIn: async (sql, arrayParam, extraParams = []) => {
-    if (!arrayParam || arrayParam.length === 0) return [[]];
-    const placeholders = arrayParam.map(() => "?").join(",");
-    const expandedSql  = sql.replace("IN (?)", `IN (${placeholders})`);
-    try {
-      const database = getDb();
-      const stmt     = database.prepare(expandedSql);
-      const rows     = [];
-      stmt.bind([...arrayParam, ...extraParams]);
-      while (stmt.step()) rows.push(stmt.getAsObject());
-      stmt.free();
-      return [rows];
-    } catch (err) {
-      console.error("DB queryIn Error:", err.message, "\nSQL:", expandedSql);
-      throw err;
-    }
-  },
-
-  // Transaction connection — mimics mysql2 pool.getConnection()
-  getConnection: async () => ({
-    query: async (sql, params = []) => {
-      try {
-        return execQuery(sql, params); // saveDb skipped while inTransaction=true
-      } catch (err) {
-        console.error("DB Conn Error:", err.message, "\nSQL:", sql);
-        throw err;
-      }
-    },
-
-    beginTransaction: async () => {
-      getDb().run("BEGIN");
+function getConnection() {
+  const conn = {
+    query: (sql, params = []) => Promise.resolve(execQuery(sql, params)),
+    beginTransaction: () => {
       inTransaction = true;
+      execQuery("BEGIN");
+      return Promise.resolve();
     },
-
-    commit: async () => {
-      getDb().run("COMMIT");
+    commit: () => {
+      execQuery("COMMIT");
       inTransaction = false;
-      saveDb(); // save once, after commit
+      saveDb();
+      return Promise.resolve();
     },
-
-    rollback: async () => {
-      try { getDb().run("ROLLBACK"); } catch (_) {}
+    rollback: () => {
+      try { execQuery("ROLLBACK"); } catch (_) {}
       inTransaction = false;
-      // no saveDb on rollback — changes discarded
+      return Promise.resolve();
     },
+    release: () => Promise.resolve(),
+  };
+  return Promise.resolve(conn);
+}
 
-    release: () => {}, // no-op (single sql.js connection)
-  }),
-
-  initDb,
-};
-
-module.exports = dbWrapper;
+module.exports = { initDb, query, queryIn, getConnection };

@@ -27,7 +27,13 @@ export function AuthProvider({ children }) {
 
   useEffect(() => {
     loadUser();
-    window.addEventListener("nd:logout", () => { setUser(null); setLoading(false); });
+    // Clean up the global logout listener so StrictMode does not register duplicates.
+    const handleLogout = () => {
+      setUser(null);
+      setLoading(false);
+    };
+    window.addEventListener("nd:logout", handleLogout);
+    return () => window.removeEventListener("nd:logout", handleLogout);
   }, [loadUser]);
 
   const login = async (email, password) => {

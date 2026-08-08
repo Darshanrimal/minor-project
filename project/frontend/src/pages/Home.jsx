@@ -13,11 +13,9 @@ const CATEGORIES = [
 ];
 
 export default function Home() {
-  const [stats, setStats]       = useState(null);
   const [campaigns, setCampaigns] = useState([]);
 
   useEffect(() => {
-    campaignAPI.stats().then(r => setStats(r.data)).catch(() => {});
     campaignAPI.list().then(r => setCampaigns((r.data.campaigns || []).slice(0, 3))).catch(() => {});
   }, []);
 
@@ -73,24 +71,6 @@ export default function Home() {
               </Link>
             </div>
 
-            {/* Platform stats */}
-            {stats && (
-              <div style={{ display:"flex", gap:40, marginTop:56, flexWrap:"wrap" }}>
-                {[
-                  { value: stats.total_campaigns,    label: "Active Campaigns" },
-                  { value: `${parseFloat(stats.total_donated || 0).toFixed(2)} SOL`, label: "Total Raised" },
-                  { value: stats.total_donors,       label: "Donors" },
-                  { value: stats.total_organizations,label: "Verified Orgs" },
-                ].map(s => (
-                  <div key={s.label}>
-                    <div style={{ fontFamily:"var(--font-display)", fontSize:28, fontWeight:800, color:"var(--saffron)" }}>
-                      {s.value}
-                    </div>
-                    <div style={{ fontSize:13, color:"rgba(255,255,255,.5)", marginTop:2 }}>{s.label}</div>
-                  </div>
-                ))}
-              </div>
-            )}
           </div>
         </div>
       </section>

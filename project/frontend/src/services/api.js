@@ -1,7 +1,12 @@
 // src/services/api.js
 import axios from "axios";
 
-const BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
+const configuredBaseUrl = import.meta.env.VITE_API_URL;
+const BASE_URL =
+  configuredBaseUrl ||
+  (typeof window !== "undefined"
+    ? `${window.location.protocol}//${window.location.hostname}:5000/api`
+    : "http://localhost:5000/api");
 
 const api = axios.create({
   baseURL: BASE_URL,
@@ -13,7 +18,7 @@ api.interceptors.request.use((config) => {
   const token = localStorage.getItem("nd_token");
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
-}, err => Promise.reject(err));
+});
 
 api.interceptors.response.use(
   (res) => res,
@@ -37,23 +42,28 @@ export const authAPI = {
 
 // ── Campaigns ─────────────────────────────────────────────────────────────────
 export const campaignAPI = {
-  list:      (params)          => api.get("/campaigns", { params }),
-  get:       (id)              => api.get(`/campaigns/${id}`),
-  create:    (data)            => api.post("/campaigns", data),
-  stats:     ()                => api.get("/campaigns/stats/platform"),
-  donate:    (id, data)        => api.post(`/campaigns/${id}/donate`, data),
-  donations: (id)              => api.get(`/campaigns/${id}/donations`),
+  list:      (params) => api.get("/campaigns", { params }),
+  get:       (id)     => api.get(`/campaigns/${id}`),
+  create:    (data)   => api.post("/campaigns", data),
+  stats:     ()       => api.get("/campaigns/stats/platform"),
+  donate:    (id, data) => api.post(`/campaigns/${id}/donate`, data),
+  donations: (id)     => api.get(`/campaigns/${id}/donations`),
   releaseMilestone: (id, idx, data) =>
     api.post(`/campaigns/${id}/milestones/${idx}/release`, data),
 };
 
 // ── Donations ─────────────────────────────────────────────────────────────────
 export const donationAPI = {
-  record:      (data)    => api.post("/donations", data),
-  byWallet:    (address) => api.get(`/donations/wallet/${address}`),
-  myDonations: ()        => api.get("/donations/my"),
-  topDonors:   ()        => api.get("/donations/top-donors"),
-  chart:       ()        => api.get("/donations/chart"),
+  // Phantom / SOL
+  record:          (data)    => api.post("/donations", data),
+  // eSewa
+  recordEsewa:     (data)    => api.post("/donations/esewa/verify", data),
+  esewaSignature:  (data)    => api.post("/donations/esewa/signature", data),
+  // History
+  byWallet:        (address) => api.get(`/donations/wallet/${address}`),
+  myDonations:     ()        => api.get("/donations/my"),
+  topDonors:       ()        => api.get("/donations/top-donors"),
+  chart:           ()        => api.get("/donations/chart"),
 };
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -75,15 +85,17 @@ export const orgAPI = {
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 export const adminAPI = {
-  stats:               ()              => api.get("/admin/stats"),
-  users:               ()              => api.get("/admin/users"),
-  setRole:             (id, role)      => api.put(`/admin/users/${id}/role`, { role }),
-  organizations:       ()              => api.get("/admin/organizations"),
-  verifyOrg:           (id, data)      => api.patch(`/admin/organizations/${id}/verify`, data),
-  campaigns:           ()              => api.get("/admin/campaigns"),
-  updateCampaignStatus:(id, is_active) => api.put(`/admin/campaigns/${id}/status`, { is_active }),
-  deleteCampaign:      (id)            => api.delete(`/admin/campaigns/${id}`),
-  toggleCampaign:      (id)            => api.patch(`/admin/campaigns/${id}/toggle`),
+  stats:                ()              => api.get("/admin/stats"),
+  users:                ()              => api.get("/admin/users"),
+  // Match the live backend method so admin role updates do not 404.
+  setRole:              (id, role)      => api.patch(`/admin/users/${id}/role`, { role }),
+  organizations:        ()              => api.get("/admin/organizations"),
+  // Match the live backend method so org verification updates do not 404.
+  verifyOrg:            (id, data)      => api.patch(`/admin/organizations/${id}/verify`, data),
+  campaigns:            ()              => api.get("/admin/campaigns"),
+  updateCampaignStatus: (id, is_active) => api.put(`/admin/campaigns/${id}/status`, { is_active }),
+  deleteCampaign:       (id)            => api.delete(`/admin/campaigns/${id}`),
+  toggleCampaign:       (id)            => api.patch(`/admin/campaigns/${id}/toggle`),
 };
 
 // ── IPFS ──────────────────────────────────────────────────────────────────────
